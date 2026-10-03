@@ -5,7 +5,8 @@
 
 // Don't include stdlb since the names will conflict?
 
-// TODO: align
+#define ALIGNMENT 8
+#define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1))
 
 // sbrk some extra space every time we need it.
 // This does no bookkeeping and therefore has no ability to free, realloc, etc.
@@ -66,11 +67,11 @@ struct block_meta *request_space(struct block_meta *last, size_t size) {
 // If not, request_space.
 void *malloc(size_t size) {
     struct block_meta *block;
-    // TODO: align size?
-
     if (size <= 0) {
         return NULL;
     }
+
+    size = ALIGN(size);
 
     if (!global_base) {  // First call.
         block = request_space(NULL, size);
