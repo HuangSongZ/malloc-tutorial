@@ -21,11 +21,12 @@ void *nofree_malloc(size_t size) {
     }
 }
 
-// sizeof(struct block_meta) 必须是 8 的倍数，
 struct block_meta {
     size_t size;
-    struct block_meta *next;
-    struct block_meta *prev;
+    struct block_meta *next;        // Physical next block
+    struct block_meta *prev;        // Physical prev block
+    struct block_meta *next_free;   // Explicit free list next
+    struct block_meta *prev_free;   // Explicit free list prev
     int free;
     int magic;  // For debugging only. TODO: remove this in non-debug mode.
 };
@@ -33,19 +34,45 @@ struct block_meta {
 #define META_SIZE sizeof(struct block_meta)
 
 void *global_base = NULL;
+struct block_meta *global_last = NULL;
+struct block_meta *free_list_head = NULL;
 
-// Iterate through blocks until we find one that's large enough.
-// TODO: split block up if it's larger than necessary
-struct block_meta *find_free_block(struct block_meta **last, size_t size) {
-    struct block_meta *current = global_base;
-    while (current && !(current->free && current->size >= size)) {
-        *last   = current;
-        current = current->next;
+void add_to_free_list(struct block_meta *block) {
+    if (!block) return;
+    block->next_free = free_list_head;
+    block->prev_free = NULL;
+    if (free_list_head) {
+        free_list_head->prev_free = block;
+    }
+    free_list_head = block;
+}
+
+void remove_from_free_list(struct block_meta *block) {
+    if (!block) return;
+    if (block->prev_free) {
+        block->prev_free->next_free = block->next_free;
+    } else {
+        if (free_list_head == block) {
+            free_list_head = block->next_free;
+        }
+    }
+    if (block->next_free) {
+        block->next_free->prev_free = block->prev_free;
+    }
+    block->next_free = NULL;
+    block->prev_free = NULL;
+}
+
+// Find free block by ONLY traversing the explicit free list
+struct block_meta *find_free_block(size_t size) {
+    struct block_meta *current = free_list_head;
+    while (current && current->size < size) {
+        current = current->next_free;
     }
     return current;
 }
 
-struct block_meta *request_space(struct block_meta *last, size_t size) {
+struct block_meta *request_space(size_t size) {
     struct block_meta *block;
     block         = sbrk(0);
     void *request = sbrk(size + META_SIZE);
@@ -54,51 +81,71 @@ struct block_meta *request_space(struct block_meta *last, size_t size) {
         return NULL;  // sbrk failed.
     }
 
-    if (last) {  // NULL on first request.
-        last->next = block;
+    if (global_last) {
+        global_last->next = block;
     }
-    block->prev  = last;
-    block->size  = size;
-    block->next  = NULL;
-    block->free  = 0;
-    block->magic = 0x12345678;
+    block->prev      = global_last;
+    block->next      = NULL;
+    block->next_free = NULL;
+    block->prev_free = NULL;
+    block->size      = size;
+    block->free      = 0;
+    block->magic     = 0x12345678;
+
+    global_last = block;
+    if (!global_base) {
+        global_base = block;
+    }
+
     return block;
 }
 
 void split_block(struct block_meta *block, size_t size) {
     if (block->size >= size + META_SIZE + ALIGNMENT) {
         struct block_meta *new_block = (struct block_meta *)((char *)(block + 1) + size);
-        new_block->size  = block->size - size - META_SIZE;
-        new_block->next  = block->next;
-        new_block->prev  = block;
-        new_block->free  = 1;
-        new_block->magic = 0x55555555;
+        new_block->size      = block->size - size - META_SIZE;
+        new_block->next      = block->next;
+        new_block->prev      = block;
+        new_block->next_free = NULL;
+        new_block->prev_free = NULL;
+        new_block->free      = 1;
+        new_block->magic     = 0x55555555;
 
         if (new_block->next) {
             new_block->next->prev = new_block;
+        } else {
+            global_last = new_block;
         }
 
         block->size = size;
         block->next = new_block;
+
+        add_to_free_list(new_block);
     }
 }
 
 struct block_meta *merge_block(struct block_meta *block) {
     // 1. Merge with next if it is free
     if (block->next && block->next->free) {
+        remove_from_free_list(block->next);
         block->size += META_SIZE + block->next->size;
         block->next = block->next->next;
         if (block->next) {
             block->next->prev = block;
+        } else {
+            global_last = block;
         }
     }
 
     // 2. Merge with prev if it is free
     if (block->prev && block->prev->free) {
+        remove_from_free_list(block->prev);
         block->prev->size += META_SIZE + block->size;
         block->prev->next = block->next;
         if (block->next) {
             block->next->prev = block->prev;
+        } else {
+            global_last = block->prev;
         }
         block = block->prev;
     }
@@ -106,36 +153,45 @@ struct block_meta *merge_block(struct block_meta *block) {
     return block;
 }
 
-// If it's the first ever call, i.e., global_base == NULL, request_space and set global_base.
-// Otherwise, if we can find a free block, use it.
-// If not, request_space.
+int shrink_heap(struct block_meta *block) {
+    // Only shrink if the block is free and is the last block in the list (at the top of the heap)
+    if (block && block->free && block->next == NULL) {
+        // The physical end address of the block exactly matches the current program break
+        if ((char *)(block + 1) + block->size == sbrk(0)) {
+            size_t bytes = block->size + META_SIZE;
+            if (block->prev) {
+                block->prev->next = NULL;
+                global_last = block->prev;
+            } else {
+                global_base = NULL;
+                global_last = NULL;
+            }
+            // return memory to the kernel via system calls
+            sbrk(-(intptr_t)bytes);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void *malloc(size_t size) {
-    struct block_meta *block;
     if (size <= 0) {
         return NULL;
     }
 
     size = ALIGN(size);
 
-    if (!global_base) {  // First call.
-        block = request_space(NULL, size);
+    struct block_meta *block = find_free_block(size);
+    if (!block) {
+        block = request_space(size);
         if (!block) {
             return NULL;
         }
-        global_base = block;
     } else {
-        struct block_meta *last = global_base;
-        block                   = find_free_block(&last, size);
-        if (!block) {  // Failed to find free block.
-            block = request_space(last, size);
-            if (!block) {
-                return NULL;
-            }
-        } else {  // Found free block
-            split_block(block, size);
-            block->free  = 0;
-            block->magic = 0x77777777;
-        }
+        remove_from_free_list(block);
+        split_block(block, size);
+        block->free  = 0;
+        block->magic = 0x77777777;
     }
 
     return (block + 1);
@@ -153,23 +209,6 @@ struct block_meta *get_block_ptr(void *ptr) {
     return (struct block_meta *)ptr - 1;
 }
 
-void shrink_heap(struct block_meta *block) {
-    // Only shrink if this is the last block and its physical end matches the program break
-    if (block && block->free && block->next == NULL) {
-        // The physical end address of the block exactly matches the current program break
-        if ((char *)(block + 1) + block->size == sbrk(0)) {
-            size_t bytes = block->size + META_SIZE;
-            if (block->prev) {
-                block->prev->next = NULL;
-            } else {
-                global_base = NULL;
-            }
-            // Invoke a system call to return memory to the kernel!
-            sbrk(-(intptr_t)bytes);
-        }
-    }
-}
-
 void free(void *ptr) {
     if (!ptr) {
         return;
@@ -182,7 +221,9 @@ void free(void *ptr) {
     block_ptr->magic = 0x55555555;
 
     block_ptr = merge_block(block_ptr);
-    shrink_heap(block_ptr);
+    if (!shrink_heap(block_ptr)) {
+        add_to_free_list(block_ptr);
+    }
 }
 
 void *realloc(void *ptr, size_t size) {
@@ -203,8 +244,12 @@ void *realloc(void *ptr, size_t size) {
     if (block_ptr->size >= size) {
         split_block(block_ptr, size);
         if (block_ptr->next && block_ptr->next->free) {
-            struct block_meta *tail = merge_block(block_ptr->next);
-            shrink_heap(tail);
+            struct block_meta *tail = block_ptr->next;
+            remove_from_free_list(tail);
+            tail = merge_block(tail);
+            if (!shrink_heap(tail)) {
+                add_to_free_list(tail);
+            }
         }
         return ptr;
     }
@@ -213,14 +258,23 @@ void *realloc(void *ptr, size_t size) {
     if (block_ptr->next && block_ptr->next->free) {
         size_t combined = block_ptr->size + META_SIZE + block_ptr->next->size;
         if (combined >= size) {
-            // Absorb right neighbor in-place
+            remove_from_free_list(block_ptr->next);
             block_ptr->size = combined;
             block_ptr->next = block_ptr->next->next;
             if (block_ptr->next) {
                 block_ptr->next->prev = block_ptr;
+            } else {
+                global_last = block_ptr;
             }
-            // Split off any excess remainder
             split_block(block_ptr, size);
+            return ptr;
+        }
+    } else if (block_ptr->next == NULL && (char *)(block_ptr + 1) + block_ptr->size == sbrk(0)) {
+        // At the top of the heap: expand in-place by moving program break!
+        size_t diff = size - block_ptr->size;
+        void *request = sbrk(diff);
+        if (request != (void *)-1) {
+            block_ptr->size = size;
             return ptr;
         }
     }
