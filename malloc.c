@@ -173,16 +173,41 @@ void *realloc(void *ptr, size_t size) {
         return malloc(size);
     }
 
+    if (size == 0) {
+        free(ptr);
+        return NULL;
+    }
+
+    size = ALIGN(size);
     struct block_meta *block_ptr = get_block_ptr(ptr);
+
+    // 1. In-place shrink / already large enough
     if (block_ptr->size >= size) {
-        // We have enough space. Could free some once we implement split.
+        split_block(block_ptr, size);
+        if (block_ptr->next && block_ptr->next->free) {
+            merge_block(block_ptr->next);
+        }
         return ptr;
     }
 
-    // Need to really realloc. Malloc new space and free old space.
-    // Then copy old data to new space.
-    void *new_ptr;
-    new_ptr = malloc(size);
+    // 2. In-place expansion: check if the right neighbor is free and large enough
+    if (block_ptr->next && block_ptr->next->free) {
+        size_t combined = block_ptr->size + META_SIZE + block_ptr->next->size;
+        if (combined >= size) {
+            // Absorb right neighbor in-place
+            block_ptr->size = combined;
+            block_ptr->next = block_ptr->next->next;
+            if (block_ptr->next) {
+                block_ptr->next->prev = block_ptr;
+            }
+            // Split off any excess remainder
+            split_block(block_ptr, size);
+            return ptr;
+        }
+    }
+
+    // 3. Fallback: out-of-place allocation + copy + free
+    void *new_ptr = malloc(size);
     if (!new_ptr) {
         return NULL;  // TODO: set errno on failure.
     }
