@@ -153,6 +153,23 @@ struct block_meta *get_block_ptr(void *ptr) {
     return (struct block_meta *)ptr - 1;
 }
 
+void shrink_heap(struct block_meta *block) {
+    // Only shrink if this is the last block and its physical end matches the program break
+    if (block && block->free && block->next == NULL) {
+        // The physical end address of the block exactly matches the current program break
+        if ((char *)(block + 1) + block->size == sbrk(0)) {
+            size_t bytes = block->size + META_SIZE;
+            if (block->prev) {
+                block->prev->next = NULL;
+            } else {
+                global_base = NULL;
+            }
+            // Invoke a system call to return memory to the kernel!
+            sbrk(-(intptr_t)bytes);
+        }
+    }
+}
+
 void free(void *ptr) {
     if (!ptr) {
         return;
@@ -164,7 +181,8 @@ void free(void *ptr) {
     block_ptr->free  = 1;
     block_ptr->magic = 0x55555555;
 
-    merge_block(block_ptr);
+    block_ptr = merge_block(block_ptr);
+    shrink_heap(block_ptr);
 }
 
 void *realloc(void *ptr, size_t size) {
@@ -185,7 +203,8 @@ void *realloc(void *ptr, size_t size) {
     if (block_ptr->size >= size) {
         split_block(block_ptr, size);
         if (block_ptr->next && block_ptr->next->free) {
-            merge_block(block_ptr->next);
+            struct block_meta *tail = merge_block(block_ptr->next);
+            shrink_heap(tail);
         }
         return ptr;
     }
