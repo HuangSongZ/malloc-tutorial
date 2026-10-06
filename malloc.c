@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -7,6 +8,10 @@
 
 #define ALIGNMENT 8
 #define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1))
+
+#define MMAP_THRESHOLD (128 * 1024)  // 128 KB
+#define PAGE_SIZE 4096
+#define PAGE_ALIGN(s) (((s) + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1))
 
 // sbrk some extra space every time we need it.
 // This does no bookkeeping and therefore has no ability to free, realloc, etc.
@@ -27,8 +32,10 @@ struct block_meta {
     struct block_meta *prev;        // Physical prev block
     struct block_meta *next_free;   // Explicit free list next
     struct block_meta *prev_free;   // Explicit free list prev
+    int is_mmap;                    // 1 if allocated by mmap, 0 if heap (sbrk)
     int free;
-    int magic;  // For debugging only. TODO: remove this in non-debug mode.
+    int magic;                      // For debugging only. TODO: remove this in non-debug mode.
+    int padding[3];                 // Pad to 64 bytes (Cache line aligned!)
 };
 
 #define META_SIZE sizeof(struct block_meta)
@@ -88,6 +95,7 @@ struct block_meta *request_space(size_t size) {
     block->next      = NULL;
     block->next_free = NULL;
     block->prev_free = NULL;
+    block->is_mmap   = 0;
     block->size      = size;
     block->free      = 0;
     block->magic     = 0x12345678;
@@ -100,6 +108,26 @@ struct block_meta *request_space(size_t size) {
     return block;
 }
 
+void *mmap_alloc(size_t size) {
+    size_t total_size = PAGE_ALIGN(size + META_SIZE);
+    void *p = mmap(NULL, total_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (p == MAP_FAILED) {
+        return NULL;
+    }
+
+    struct block_meta *block = (struct block_meta *)p;
+    block->size      = total_size - META_SIZE;
+    block->next      = NULL;
+    block->prev      = NULL;
+    block->next_free = NULL;
+    block->prev_free = NULL;
+    block->is_mmap   = 1;
+    block->free      = 0;
+    block->magic     = 0x12345678;
+
+    return (block + 1);
+}
+
 void split_block(struct block_meta *block, size_t size) {
     if (block->size >= size + META_SIZE + ALIGNMENT) {
         struct block_meta *new_block = (struct block_meta *)((char *)(block + 1) + size);
@@ -108,6 +136,7 @@ void split_block(struct block_meta *block, size_t size) {
         new_block->prev      = block;
         new_block->next_free = NULL;
         new_block->prev_free = NULL;
+        new_block->is_mmap   = 0;
         new_block->free      = 1;
         new_block->magic     = 0x55555555;
 
@@ -181,6 +210,11 @@ void *malloc(size_t size) {
 
     size = ALIGN(size);
 
+    // Large objects bypass heap and go directly to mmap
+    if (size >= MMAP_THRESHOLD) {
+        return mmap_alloc(size);
+    }
+
     struct block_meta *block = find_free_block(size);
     if (!block) {
         block = request_space(size);
@@ -215,6 +249,14 @@ void free(void *ptr) {
     }
 
     struct block_meta *block_ptr = get_block_ptr(ptr);
+
+    // If allocated via mmap, unmap directly back to the kernel!
+    if (block_ptr->is_mmap) {
+        size_t total_size = block_ptr->size + META_SIZE;
+        munmap(block_ptr, total_size);
+        return;
+    }
+
     assert(block_ptr->free == 0);
     assert(block_ptr->magic == 0x77777777 || block_ptr->magic == 0x12345678);
     block_ptr->free  = 1;
@@ -240,7 +282,33 @@ void *realloc(void *ptr, size_t size) {
     size = ALIGN(size);
     struct block_meta *block_ptr = get_block_ptr(ptr);
 
-    // 1. In-place shrink / already large enough
+    // If currently an mmap block:
+    if (block_ptr->is_mmap) {
+        if (block_ptr->size >= size && (block_ptr->size - size) < MMAP_THRESHOLD) {
+            return ptr;
+        }
+        void *new_ptr = malloc(size);
+        if (!new_ptr) {
+            return NULL;
+        }
+        size_t copy_size = (block_ptr->size < size) ? block_ptr->size : size;
+        memcpy(new_ptr, ptr, copy_size);
+        free(ptr);
+        return new_ptr;
+    }
+
+    // If currently a heap block, but new size is large enough to require mmap:
+    if (size >= MMAP_THRESHOLD) {
+        void *new_ptr = malloc(size);
+        if (!new_ptr) {
+            return NULL;
+        }
+        memcpy(new_ptr, ptr, block_ptr->size);
+        free(ptr);
+        return new_ptr;
+    }
+
+    // 1. In-place shrink / already large enough (heap)
     if (block_ptr->size >= size) {
         split_block(block_ptr, size);
         if (block_ptr->next && block_ptr->next->free) {
