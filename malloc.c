@@ -1,4 +1,6 @@
+#define _GNU_SOURCE
 #include <assert.h>
+#include <pthread.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/types.h>
@@ -13,15 +15,20 @@
 #define PAGE_SIZE 4096
 #define PAGE_ALIGN(s) (((s) + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1))
 
+pthread_mutex_t global_malloc_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+
 // sbrk some extra space every time we need it.
 // This does no bookkeeping and therefore has no ability to free, realloc, etc.
 void *nofree_malloc(size_t size) {
+    pthread_mutex_lock(&global_malloc_lock);
     void *p       = sbrk(0);
     void *request = sbrk(size);
     if (request == (void *)-1) {
+        pthread_mutex_unlock(&global_malloc_lock);
         return NULL;  // sbrk failed
     } else {
-        assert(p == request);  // Not thread safe.
+        assert(p == request);  // Thread safe with global_malloc_lock.
+        pthread_mutex_unlock(&global_malloc_lock);
         return p;
     }
 }
@@ -208,17 +215,22 @@ void *malloc(size_t size) {
         return NULL;
     }
 
+    pthread_mutex_lock(&global_malloc_lock);
+
     size = ALIGN(size);
 
     // Large objects bypass heap and go directly to mmap
     if (size >= MMAP_THRESHOLD) {
-        return mmap_alloc(size);
+        void *ptr = mmap_alloc(size);
+        pthread_mutex_unlock(&global_malloc_lock);
+        return ptr;
     }
 
     struct block_meta *block = find_free_block(size);
     if (!block) {
         block = request_space(size);
         if (!block) {
+            pthread_mutex_unlock(&global_malloc_lock);
             return NULL;
         }
     } else {
@@ -228,6 +240,7 @@ void *malloc(size_t size) {
         block->magic = 0x77777777;
     }
 
+    pthread_mutex_unlock(&global_malloc_lock);
     return (block + 1);
 }
 
@@ -248,11 +261,14 @@ void free(void *ptr) {
         return;
     }
 
+    pthread_mutex_lock(&global_malloc_lock);
+
     struct block_meta *block_ptr = get_block_ptr(ptr);
 
     // If allocated via mmap, unmap directly back to the kernel!
     if (block_ptr->is_mmap) {
         size_t total_size = block_ptr->size + META_SIZE;
+        pthread_mutex_unlock(&global_malloc_lock);
         munmap(block_ptr, total_size);
         return;
     }
@@ -266,6 +282,8 @@ void free(void *ptr) {
     if (!shrink_heap(block_ptr)) {
         add_to_free_list(block_ptr);
     }
+
+    pthread_mutex_unlock(&global_malloc_lock);
 }
 
 void *realloc(void *ptr, size_t size) {
@@ -279,21 +297,26 @@ void *realloc(void *ptr, size_t size) {
         return NULL;
     }
 
+    pthread_mutex_lock(&global_malloc_lock);
+
     size = ALIGN(size);
     struct block_meta *block_ptr = get_block_ptr(ptr);
 
     // If currently an mmap block:
     if (block_ptr->is_mmap) {
         if (block_ptr->size >= size && (block_ptr->size - size) < MMAP_THRESHOLD) {
+            pthread_mutex_unlock(&global_malloc_lock);
             return ptr;
         }
         void *new_ptr = malloc(size);
         if (!new_ptr) {
+            pthread_mutex_unlock(&global_malloc_lock);
             return NULL;
         }
         size_t copy_size = (block_ptr->size < size) ? block_ptr->size : size;
         memcpy(new_ptr, ptr, copy_size);
         free(ptr);
+        pthread_mutex_unlock(&global_malloc_lock);
         return new_ptr;
     }
 
@@ -301,10 +324,12 @@ void *realloc(void *ptr, size_t size) {
     if (size >= MMAP_THRESHOLD) {
         void *new_ptr = malloc(size);
         if (!new_ptr) {
+            pthread_mutex_unlock(&global_malloc_lock);
             return NULL;
         }
         memcpy(new_ptr, ptr, block_ptr->size);
         free(ptr);
+        pthread_mutex_unlock(&global_malloc_lock);
         return new_ptr;
     }
 
@@ -319,6 +344,7 @@ void *realloc(void *ptr, size_t size) {
                 add_to_free_list(tail);
             }
         }
+        pthread_mutex_unlock(&global_malloc_lock);
         return ptr;
     }
 
@@ -335,6 +361,7 @@ void *realloc(void *ptr, size_t size) {
                 global_last = block_ptr;
             }
             split_block(block_ptr, size);
+            pthread_mutex_unlock(&global_malloc_lock);
             return ptr;
         }
     } else if (block_ptr->next == NULL && (char *)(block_ptr + 1) + block_ptr->size == sbrk(0)) {
@@ -343,6 +370,7 @@ void *realloc(void *ptr, size_t size) {
         void *request = sbrk(diff);
         if (request != (void *)-1) {
             block_ptr->size = size;
+            pthread_mutex_unlock(&global_malloc_lock);
             return ptr;
         }
     }
@@ -350,9 +378,11 @@ void *realloc(void *ptr, size_t size) {
     // 3. Fallback: out-of-place allocation + copy + free
     void *new_ptr = malloc(size);
     if (!new_ptr) {
+        pthread_mutex_unlock(&global_malloc_lock);
         return NULL;  // TODO: set errno on failure.
     }
     memcpy(new_ptr, ptr, block_ptr->size);
     free(ptr);
+    pthread_mutex_unlock(&global_malloc_lock);
     return new_ptr;
 }
